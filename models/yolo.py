@@ -578,7 +578,7 @@ class Model(nn.Module):
         self.info()
         logger.info('')
 
-    def forward(self, x, augment=False, profile=False):
+    def forward(self, x, augment=False, profile=False, extra_features: list = []):
         if augment:
             img_size = x.shape[-2:]  # height, width
             s = [1, 0.83, 0.67]  # scales
@@ -596,39 +596,56 @@ class Model(nn.Module):
                 y.append(yi)
             return torch.cat(y, 1), None  # augmented inference, train
         else:
-            return self.forward_once(x, profile)  # single-scale inference, train
+            return self.forward_once(x, profile, extra_features)  # single-scale inference, train
 
-    def forward_once(self, x, profile=False):
+
+    def forward_once(self, x, profile=False, extra_features: list = []):
         y, dt = [], []  # outputs
-        for m in self.model:
+        features = []
+        for i, m in enumerate(self.model):
             if m.f != -1:  # if not from previous layer
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
 
-            if not hasattr(self, 'traced'):
-                self.traced=False
+            if not hasattr(self, "traced"):
+                self.traced = False
 
             if self.traced:
-                if isinstance(m, Detect) or isinstance(m, IDetect) or isinstance(m, IAuxDetect) or isinstance(m, IKeypoint):
+                if (
+                    isinstance(m, Detect)
+                    or isinstance(m, IDetect)
+                    or isinstance(m, IAuxDetect)
+                    or isinstance(m, IKeypoint)
+                ):
                     break
 
             if profile:
                 c = isinstance(m, (Detect, IDetect, IAuxDetect, IBin))
-                o = thop.profile(m, inputs=(x.copy() if c else x,), verbose=False)[0] / 1E9 * 2 if thop else 0  # FLOPS
+                o = thop.profile(m, inputs=(x.copy() if c else x,), verbose=False)[0] / 1e9 * 2 if thop else 0  # FLOPS
                 for _ in range(10):
                     m(x.copy() if c else x)
                 t = time_synchronized()
                 for _ in range(10):
                     m(x.copy() if c else x)
                 dt.append((time_synchronized() - t) * 100)
-                print('%10.1f%10.0f%10.1fms %-40s' % (o, m.np, dt[-1], m.type))
+                print("%10.1f%10.0f%10.1fms %-40s" % (o, m.np, dt[-1], m.type))
 
             x = m(x)  # run
-            
+
             y.append(x if m.i in self.save else None)  # save output
 
+            if i in extra_features:
+                features.append(x)
+            if not self.training and len(extra_features) != 0 and len(extra_features) == len(features):
+                return x, features
+
         if profile:
-            print('%.1fms total' % sum(dt))
+            print("%.1fms total" % sum(dt))
+        if len(extra_features) != 0:
+            return x, features
+        if self.training and isinstance(x, tuple):
+            x = x[-1]
         return x
+
 
     def _initialize_biases(self, cf=None):  # initialize biases into Detect(), cf is class frequency
         # https://arxiv.org/abs/1708.02002 section 3.3

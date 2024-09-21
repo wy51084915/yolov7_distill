@@ -29,3 +29,6 @@ mixup: 0.15  # image mixup (probability)
 copy_paste: 0.0  # image copy paste (probability)
 paste_in: 0.15  # image copy paste (probability), use 0 for faster training
 loss_ota: 1 # use ComputeLossOTA, use 0 for faster training
+student_kd_layers: [75,88,101]
+# teacher_kd_layers: [75,88,101]
+teacher_kd_layers: [87,102,117]
