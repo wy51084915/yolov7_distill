@@ -30,7 +30,7 @@ from utils.general import labels_to_class_weights, increment_path, labels_to_ima
     fitness, strip_optimizer, get_latest_run, check_dataset, check_file, check_git_status, check_img_size, \
     check_requirements, print_mutation, set_logging, one_cycle, colorstr
 from utils.google_utils import attempt_download
-from utils.loss import ComputeLoss, ComputeLossOTA, FeatureLoss
+from utils.loss import ComputeLoss, ComputeLossOTA, CFFFeatureLoss
 from utils.plots import plot_images, plot_labels, plot_results, plot_evolution
 from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, is_parallel
 from utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
@@ -109,11 +109,21 @@ def train(hyp, opt, device, tb_writer=None):
         # teacher_model.model[-1].train()
         logger.info(f"Load teacher model from {teacher_weights}")  # report
 
+        # teacher high model
+        teacher_high_weights = opt.teacher_high_weights
+        teacher_high_model = Model(opt.teacher_high_cfg, ch=3, nc=nc).to(device)  # create    
+        ckpt = torch.load(teacher_high_weights, map_location=device)  # load checkpoint
+        state_dict = ckpt["model"].float().state_dict()  # to FP32
+        teacher_high_model.load_state_dict(state_dict, strict=True)  # load
+        teacher_high_model.eval()
+        logger.info(f"Load high teacher model from {teacher_high_model}")  # report
+
     # DP mode
     if cuda and rank == -1 and torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
         if opt.teacher_weights:
             teacher_model = torch.nn.DataParallel(teacher_model)
+            teacher_high_model = torch.nn.DataParallel(teacher_high_model)
             
 	 # SyncBatchNorm
     if opt.sync_bn and cuda and rank != -1:
@@ -121,9 +131,12 @@ def train(hyp, opt, device, tb_writer=None):
         logger.info("Using SyncBatchNorm()")
         if opt.teacher_weights:
             teacher_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(teacher_model).to(device)
+            teacher_high_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(teacher_high_model).to(device)
     # teacher模型不需要反向传播
     if opt.teacher_weights:
             for param in teacher_model.parameters():
+                param.requires_grad = False
+            for param in teacher_high_model.parameters():
                 param.requires_grad = False
 
     with torch_distributed_zero_first(rank):
@@ -279,6 +292,7 @@ def train(hyp, opt, device, tb_writer=None):
                                             hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect, rank=rank,
                                             world_size=opt.world_size, workers=opt.workers,
                                             image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train: '))
+
     mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
     nb = len(dataloader)  # number of batches
     assert mlc < nc, 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, nc, opt.data, nc - 1)
@@ -326,18 +340,25 @@ def train(hyp, opt, device, tb_writer=None):
     if opt.teacher_weights:
         student_kd_layers = hyp["student_kd_layers"]
         teacher_kd_layers = hyp["teacher_kd_layers"]
+        teacher_high_kd_layers = hyp["teacher_kd_layers"]
         dump_image = torch.zeros((1, 3, imgsz, imgsz), device=device)
+        high_dump_image = torch.zeros((1, 3, 2*imgsz, 2*imgsz), device=device)
         targets = torch.Tensor([[0, 0, 0, 0, 0, 0]]).to(device)
         _, features = model(dump_image, extra_features = student_kd_layers)  # forward
         _, teacher_features = teacher_model(dump_image, extra_features=teacher_kd_layers)
+        _, teacher_high_features = teacher_high_model(high_dump_image, extra_features=teacher_high_kd_layers)
         kd_losses = []
         for i in range(len(features)):
             feature = features[i]
             teacher_feature = teacher_features[i]
+            teacher_high_feature = teacher_high_features[i]
             _, student_channels, _ , _ = feature.shape
             _, teacher_channels, _ , _ = teacher_feature.shape
+            _, teacher_high_channels, _ , _ = teacher_high_feature.shape
 
-            kd_losses.append(FeatureLoss(student_channels,teacher_channels))
+            kd_losses.append(CFFFeatureLoss(student_channels,teacher_channels, teacher_high_channels).cuda())
+        for loss in kd_losses:
+            optimizer.add_param_group({'params': loss.parameters()})  # add kd loss parameters
 
 
     # Start training
@@ -379,6 +400,7 @@ def train(hyp, opt, device, tb_writer=None):
         mloss = torch.zeros(5, device=device)  # mean losses
         if rank != -1:
             dataloader.sampler.set_epoch(epoch)
+
         pbar = enumerate(dataloader)
         logger.info(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'total', 'labels', 'img_size'))
         if rank in [-1, 0]:
@@ -387,6 +409,7 @@ def train(hyp, opt, device, tb_writer=None):
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device, non_blocking=True).float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0
+            imgs_high = F.interpolate(imgs, size=(2*imgsz, 2*imgsz), mode='bilinear', align_corners=False)
 
             # Warmup
             if ni <= nw:
@@ -413,6 +436,7 @@ def train(hyp, opt, device, tb_writer=None):
                 if opt.teacher_weights:
                     pred, features = model(imgs, extra_features = student_kd_layers)  # forward
                     _, teacher_features = teacher_model(imgs, extra_features = teacher_kd_layers)
+                    _, teacher_high_features = teacher_high_model(imgs_high, extra_features = teacher_high_kd_layers)
                     ota_start = 0  # Define ota_start variable
                     if "loss_ota" not in hyp or hyp["loss_ota"] == 1 and epoch >= ota_start:
                         loss, loss_items = compute_loss_ota(pred, targets.to(device), imgs)
@@ -601,9 +625,11 @@ def train(hyp, opt, device, tb_writer=None):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--teacher_weights', type=str, default='things7x.pt', help='teacher model weights')
+    parser.add_argument('--teacher_high_weights', type=str, default='things7-w6.pt', help='high teacher model weights')
     parser.add_argument('--weights', type=str, default='things7.pt', help='initial weights path')
     parser.add_argument('--cfg', type=str, default='cfg/training/yolov7.yaml', help='model.yaml path')
     parser.add_argument('--teacher_cfg', type=str, default='cfg/training/yolov7x.yaml', help='teacher model.yaml path')
+    parser.add_argument('--teacher_high_cfg', type=str, default='cfg/training/yolov7x.yaml', help='teacher model.yaml path')
     parser.add_argument('--data', type=str, default='data/NewThings.yaml', help='data.yaml path')
     parser.add_argument('--hyp', type=str, default='data/hyp.scratch.p5.yaml', help='hyperparameters path')
     parser.add_argument('--epochs', type=int, default=30)

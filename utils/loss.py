@@ -35,6 +35,34 @@ def kaiming_init(module,
     if hasattr(module, 'bias') and module.bias is not None:
         nn.init.constant_(module.bias, bias)
 
+
+class CFFModule(nn.Module):
+    """Cross Feature Fusion (CFF) module.
+    Args:
+        feature_high (Tensor): High-level feature map.
+        feature_low (Tensor): Low-level feature map.
+    Returns:
+        Tensor: Fused feature map.
+    """
+    def __init__(self, ch1, ch2, reductions=16):
+        super(CFFModule, self).__init__()
+        self.reductions = reductions
+        self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Sequential(
+            nn.Linear(ch1 + ch2, (ch1 + ch2) // reductions, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear((ch1 + ch2) // reductions, 2, bias=False),
+            nn.Softmax(dim=2)
+        )
+        
+    def forward(self, feature_high, feature_low):
+        feature_fuse = torch.cat((feature_high, feature_low), dim=1)
+        N, C, H, W = feature_fuse.size()
+        feature_fuse = self.avg_pool(feature_high).view(N, C)
+        weight = self.fc(feature_fuse).view(N, 2, 1, 1)
+        return feature_high * weight[:, 0, :, :] + feature_low * weight[:, 1, :, :]
+
+
 class FeatureLoss(nn.Module):
 
     """PyTorch version of `Feature Distillation for General Detectors`
@@ -108,6 +136,243 @@ class FeatureLoss(nn.Module):
 
         N,C,H,W = preds_S.shape
 
+        S_attention_t, C_attention_t = self.get_attention(preds_T, self.temp)
+        S_attention_s, C_attention_s = self.get_attention(preds_S, self.temp)
+        
+        Mask_fg = torch.zeros_like(S_attention_t)
+        # Mask_bg = torch.ones_like(S_attention_t)
+        wmin,wmax,hmin,hmax = [],[],[],[]
+        img_h, img_w = img_metas
+        bboxes = gt_bboxes[:,2:6]
+        #xywh2xyxy
+        bboxes = xywh2xyxy(bboxes)
+        new_boxxes = torch.ones_like(bboxes)
+        new_boxxes[:, 0] = torch.floor(bboxes[:, 0]*W)
+        new_boxxes[:, 2] = torch.ceil(bboxes[:, 2]*W)
+        new_boxxes[:, 1] = torch.floor(bboxes[:, 1]*H)
+        new_boxxes[:, 3] = torch.ceil(bboxes[:, 3]*H)
+
+        #to int
+        new_boxxes = new_boxxes.int()
+
+        for i in range(N):
+            new_boxxes_i = new_boxxes[torch.where(gt_bboxes[:,0]==i)]
+
+            wmin.append(new_boxxes_i[:, 0])
+            wmax.append(new_boxxes_i[:, 2])
+            hmin.append(new_boxxes_i[:, 1])
+            hmax.append(new_boxxes_i[:, 3])
+
+            area = 1.0/(hmax[i].view(1,-1)+1-hmin[i].view(1,-1))/(wmax[i].view(1,-1)+1-wmin[i].view(1,-1))
+
+            for j in range(len(new_boxxes_i)):
+                Mask_fg[i][hmin[i][j]:hmax[i][j]+1, wmin[i][j]:wmax[i][j]+1] = \
+                        torch.maximum(Mask_fg[i][hmin[i][j]:hmax[i][j]+1, wmin[i][j]:wmax[i][j]+1], area[0][j])
+
+        Mask_bg = torch.where(Mask_fg > 0, 0., 1.)
+        Mask_bg_sum = torch.sum(Mask_bg, dim=(1,2))
+        Mask_bg[Mask_bg_sum>0] /= Mask_bg_sum[Mask_bg_sum>0].unsqueeze(1).unsqueeze(2)
+
+        fg_loss, bg_loss = self.get_fea_loss(preds_S, preds_T, Mask_fg, Mask_bg, 
+                        C_attention_s, C_attention_t, S_attention_s, S_attention_t)
+        mask_loss = self.get_mask_loss(C_attention_s, C_attention_t, S_attention_s, S_attention_t)
+        rela_loss = self.get_rela_loss(preds_S, preds_T)
+
+        loss = self.alpha_fgd * fg_loss + self.beta_fgd * bg_loss \
+            + self.gamma_fgd * mask_loss + self.lambda_fgd * rela_loss
+            
+        return loss, loss.detach()
+
+    def get_attention(self, preds, temp):
+        """ preds: Bs*C*W*H """
+        N, C, H, W= preds.shape
+
+        value = torch.abs(preds)
+        # Bs*W*H
+        fea_map = value.mean(axis=1, keepdim=True)
+        S_attention = (H * W * F.softmax((fea_map/temp).view(N,-1), dim=1)).view(N, H, W)
+
+        # Bs*C
+        channel_map = value.mean(axis=2,keepdim=False).mean(axis=2,keepdim=False)
+        C_attention = C * F.softmax(channel_map/temp, dim=1)
+
+        return S_attention, C_attention
+
+
+    def get_fea_loss(self, preds_S, preds_T, Mask_fg, Mask_bg, C_s, C_t, S_s, S_t):
+        loss_mse = nn.MSELoss(reduction='sum')
+        
+        Mask_fg = Mask_fg.unsqueeze(dim=1)
+        Mask_bg = Mask_bg.unsqueeze(dim=1)
+
+        C_t = C_t.unsqueeze(dim=-1)
+        C_t = C_t.unsqueeze(dim=-1)
+
+        S_t = S_t.unsqueeze(dim=1)
+
+        fea_t= torch.mul(preds_T, torch.sqrt(S_t))
+        fea_t = torch.mul(fea_t, torch.sqrt(C_t))
+        fg_fea_t = torch.mul(fea_t, torch.sqrt(Mask_fg))
+        bg_fea_t = torch.mul(fea_t, torch.sqrt(Mask_bg))
+
+        fea_s = torch.mul(preds_S, torch.sqrt(S_t))
+        fea_s = torch.mul(fea_s, torch.sqrt(C_t))
+        fg_fea_s = torch.mul(fea_s, torch.sqrt(Mask_fg))
+        bg_fea_s = torch.mul(fea_s, torch.sqrt(Mask_bg))
+
+        fg_loss = loss_mse(fg_fea_s, fg_fea_t)/len(Mask_fg)
+        bg_loss = loss_mse(bg_fea_s, bg_fea_t)/len(Mask_bg)
+
+        return fg_loss, bg_loss
+
+
+    def get_mask_loss(self, C_s, C_t, S_s, S_t):
+
+        mask_loss = torch.sum(torch.abs((C_s-C_t)))/len(C_s) + torch.sum(torch.abs((S_s-S_t)))/len(S_s)
+
+        return mask_loss
+     
+    
+    def spatial_pool(self, x, in_type):
+        batch, channel, width, height = x.size()
+        input_x = x
+        # [N, C, H * W]
+        input_x = input_x.view(batch, channel, height * width)
+        # [N, 1, C, H * W]
+        input_x = input_x.unsqueeze(1)
+        # [N, 1, H, W]
+        if in_type == 0:
+            context_mask = self.conv_mask_s(x)
+        else:
+            context_mask = self.conv_mask_t(x)
+        # [N, 1, H * W]
+        context_mask = context_mask.view(batch, 1, height * width)
+        # [N, 1, H * W]
+        context_mask = F.softmax(context_mask, dim=2)
+        # [N, 1, H * W, 1]
+        context_mask = context_mask.unsqueeze(-1)
+        # [N, 1, C, 1]
+        context = torch.matmul(input_x, context_mask)
+        # [N, C, 1, 1]
+        context = context.view(batch, channel, 1, 1)
+
+        return context
+
+
+    def get_rela_loss(self, preds_S, preds_T):
+        loss_mse = nn.MSELoss(reduction='sum')
+
+        context_s = self.spatial_pool(preds_S, 0)
+        context_t = self.spatial_pool(preds_T, 1)
+
+        out_s = preds_S
+        out_t = preds_T
+
+        channel_add_s = self.channel_add_conv_s(context_s)
+        out_s = out_s + channel_add_s
+
+        channel_add_t = self.channel_add_conv_t(context_t)
+        out_t = out_t + channel_add_t
+
+        rela_loss = loss_mse(out_s, out_t)/len(out_s)
+        
+        return rela_loss
+
+
+    def last_zero_init(self, m):
+        if isinstance(m, nn.Sequential):
+            constant_init(m[-1], val=0)
+        else:
+            constant_init(m, val=0)
+
+    
+    def reset_parameters(self):
+        kaiming_init(self.conv_mask_s, mode='fan_in')
+        kaiming_init(self.conv_mask_t, mode='fan_in')
+        self.conv_mask_s.inited = True
+        self.conv_mask_t.inited = True
+
+        self.last_zero_init(self.channel_add_conv_s)
+        self.last_zero_init(self.channel_add_conv_t)
+
+
+class CFFFeatureLoss(nn.Module):
+
+    """PyTorch version of `Feature Distillation for General Detectors`
+   
+    Args:
+        student_channels(int): Number of channels in the student's feature map.
+        teacher_channels(int): Number of channels in the teacher's feature map. 
+        temp (float, optional): Temperature coefficient. Defaults to 0.5.
+        name (str): the loss name of the layer
+        alpha_fgd (float, optional): Weight of fg_loss. Defaults to 0.001
+        beta_fgd (float, optional): Weight of bg_loss. Defaults to 0.0005
+        gamma_fgd (float, optional): Weight of mask_loss. Defaults to 0.0005
+        lambda_fgd (float, optional): Weight of relation_loss. Defaults to 0.000005
+    """
+    def __init__(self,
+                 student_channels,
+                 teacher_channels,
+                 teacher_high_channels,
+                 temp=0.5,
+                 alpha_fgd=0.001,
+                 beta_fgd=0.0005,
+                 gamma_fgd=0.001,
+                 lambda_fgd=0.000005,
+                 ):
+        super(FeatureLoss, self).__init__()
+        self.temp = temp
+        self.alpha_fgd = alpha_fgd
+        self.beta_fgd = beta_fgd
+        self.gamma_fgd = gamma_fgd
+        self.lambda_fgd = lambda_fgd
+
+        self.CFF = CFFModule(teacher_channels, teacher_high_channels)
+        if student_channels != teacher_channels:
+            self.align = nn.Conv2d(student_channels, teacher_channels, kernel_size=1, stride=1, padding=0)
+        else:
+            self.align = None
+        
+        self.conv_mask_s = nn.Conv2d(teacher_channels, 1, kernel_size=1)
+        self.conv_mask_t = nn.Conv2d(teacher_channels, 1, kernel_size=1)
+        self.channel_add_conv_s = nn.Sequential(
+            nn.Conv2d(teacher_channels, teacher_channels//2, kernel_size=1),
+            nn.LayerNorm([teacher_channels//2, 1, 1]),
+            nn.ReLU(inplace=True),  # yapf: disable
+            nn.Conv2d(teacher_channels//2, teacher_channels, kernel_size=1))
+        self.channel_add_conv_t = nn.Sequential(
+            nn.Conv2d(teacher_channels, teacher_channels//2, kernel_size=1),
+            nn.LayerNorm([teacher_channels//2, 1, 1]),
+            nn.ReLU(inplace=True),  # yapf: disable
+            nn.Conv2d(teacher_channels//2, teacher_channels, kernel_size=1))
+
+        self.reset_parameters()
+
+    def forward(self,
+                preds_S,
+                preds_T,
+                preds_T_high,
+                gt_bboxes,
+                img_metas):
+        """Forward function.
+        Args:
+            preds_S(Tensor): Bs*C*H*W, student's feature map
+            preds_T(Tensor): Bs*C*H*W, teacher's feature map
+            gt_bboxes(tuple): Bs*[nt*4], pixel decimal: (tl_x, tl_y, br_x, br_y)
+            img_metas (list[dict]): Meta information of each image, e.g.,
+            image size, scaling factor, etc.
+        """
+        # print(preds_S.shape)
+        # print(preds_T.shape)
+        assert preds_S.shape[-2:] == preds_T.shape[-2:], 'the output dim of teacher and student differ'
+        device = gt_bboxes.device
+        self.to(device)
+        if self.align is not None:
+            preds_S = self.align(preds_S)
+
+        N,C,H,W = preds_S.shape
+
+        preds_T = self.CFF(preds_T, preds_T_high)
         S_attention_t, C_attention_t = self.get_attention(preds_T, self.temp)
         S_attention_s, C_attention_s = self.get_attention(preds_S, self.temp)
         
